@@ -1,12 +1,8 @@
-# Makefile.camp - QEMU Camp 2026 Experiment Build System
+# Makefile.camp - QEMU Camp 2026 Experiment Build System (GPGPU only)
 #
 # Usage: make -f Makefile.camp [target]
 #
-# All experiments are RISC-V based.
-#   - CPU experiment:  TCG testcase  (tests/gevico/tcg)    [softmmu]
-#   - SoC experiment:  QTest         (tests/gevico/qtest)  [softmmu]
-#   - GPGPU experiment: QTest        (tests/gevico/qtest)  [softmmu]
-#   - Rust experiment: QTest + unit  (tests/gevico/qtest)  [softmmu + rust]
+#   - GPGPU experiment: QTest (QOS)  tests/qtest/gpgpu-test.c  [softmmu]
 
 SHELL := bash -o pipefail
 MAKEFLAGS += -rR
@@ -15,19 +11,11 @@ MAKEFLAGS += -rR
 SRC_DIR   := $(realpath $(dir $(lastword $(MAKEFILE_LIST))))
 BUILD_DIR := $(SRC_DIR)/build
 
-# RISC-V cross compiler (for TCG testcases)
-CROSS_PREFIX ?= riscv64-unknown-elf-
-
-# Configure flags — one config to rule all experiments:
-#   riscv64-softmmu    : SoC/GPGPU QTest + CPU TCG system tests
-#   riscv64-linux-user : CPU TCG user-mode tests
-#   --enable-rust      : Rust experiment unit tests
-#   --cross-prefix     : bare-metal cross compiler for TCG testcases
+# Configure flags:
+#   riscv64-softmmu : GPGPU QTest (virt machine + PCI)
 CONFIGURE_FLAGS := \
-    --target-list=riscv64-softmmu,riscv64-linux-user \
-    --extra-cflags='-O0 -g3' \
-    --cross-prefix-riscv64=$(CROSS_PREFIX) \
-    --enable-rust
+    --target-list=riscv64-softmmu \
+    --extra-cflags='-O0 -g3'
 
 # Parallel jobs (default: nproc)
 NPROC := $(shell nproc 2>/dev/null || echo 4)
@@ -40,7 +28,7 @@ MESON = $(BUILD_DIR)/pyvenv/bin/meson
 
 .PHONY: help
 help:
-	@echo "QEMU Camp 2026 - Experiment Build System"
+	@echo "QEMU Camp 2026 - Experiment Build System (GPGPU)"
 	@echo ""
 	@echo "Usage: make -f Makefile.camp <target>"
 	@echo ""
@@ -51,12 +39,7 @@ help:
 	@echo ""
 	@echo "Test targets:"
 	@echo "  test               Run all experiment tests"
-	@echo "  test-cpu           Run CPU experiment tests (TCG testcase)"
-	@echo "  test-soc           Run SoC experiment tests (QTest)"
 	@echo "  test-gpgpu         Run GPGPU experiment tests (QTest)"
-	@echo "  test-rust          Run Rust experiment tests (QTest + unit)"
-	@echo "  test-rust-unit     Run Rust native unit tests only"
-	@echo "  test-rust-qtest    Run Rust QTest tests only"
 	@echo ""
 	@echo "Clean targets:"
 	@echo "  clean              Clean build artifacts"
@@ -64,8 +47,6 @@ help:
 	@echo ""
 	@echo "Options:"
 	@echo "  JOBS=N             Parallel jobs (default: $(NPROC))"
-	@echo "  CROSS_PREFIX=...   RISC-V cross compiler prefix"
-	@echo "                     (default: riscv64-unknown-elf-)"
 	@echo "  V=1                Verbose output"
 
 # ─── Configure ────────────────────────────────────────────────────────
@@ -88,34 +69,6 @@ build: $(BUILD_DIR)/config-host.mak
 
 .PHONY: rebuild
 rebuild: clean build
-
-# ─── CPU experiment (TCG testcase) ────────────────────────────────────
-
-.PHONY: test-cpu
-test-cpu: build
-	$(MAKE) -C $(BUILD_DIR) check-gevico-tcg
-	@echo "--- CPU experiment tests done ---"
-
-# ─── SoC experiment (QTest) ───────────────────────────────────────────
-# 10 tests, each run as an independent meson test target
-
-SOC_TESTS := test-board-g233 test-gpio-basic test-gpio-int \
-             test-pwm-basic test-wdt-timeout test-spi-jedec \
-             test-flash-read test-flash-read-interrupt \
-             test-spi-cs test-spi-overrun
-
-.PHONY: test-soc
-test-soc: build
-	@passed=0; total=0; \
-	for t in $(SOC_TESTS); do \
-	    total=$$((total + 1)); \
-	    if cd $(BUILD_DIR) && $(MESON) test --no-rebuild --print-errorlogs \
-	        "qtest-riscv64/$$t" 2>/dev/null; then \
-	        passed=$$((passed + 1)); \
-	    fi; \
-	done; \
-	echo "$$passed" > $(BUILD_DIR)/soc-result.log; \
-	echo "--- SoC experiment: $$passed/$$total tests passed ---"
 
 # ─── GPGPU experiment (QTest via QOS) ─────────────────────────────────
 # 17 subtests inside qos-test, run individually for scoring.
@@ -145,46 +98,10 @@ test-gpgpu: build
 	echo "$$passed" > $(BUILD_DIR)/gpgpu-result.log; \
 	echo "--- GPGPU experiment: $$passed/$(GPGPU_TOTAL) tests passed, score $$score/100 ---"
 
-# ─── Rust experiment (3 unit tests + 7 QTest = 10 tests, 100 pts) ─────
-
-RUST_QTEST_TESTS := test-i2c-gpio-init test-i2c-gpio-bitbang \
-                     test-i2c-eeprom-rw test-i2c-eeprom-page \
-                     test-spi-rust-init test-spi-rust-transfer \
-                     test-spi-rust-flash
-
-RUST_UNIT_NAMES := test_i2c_bus_create test_i2c_bus_read_write test_i2c_bus_nack
-
-.PHONY: test-rust
-test-rust: build
-	@passed=0; \
-	echo "=== Rust unit tests (I2C bus) ==="; \
-	for t in $(RUST_UNIT_NAMES); do \
-	    if cd $(BUILD_DIR) && $(MESON) test --no-rebuild \
-	        --test-args "$$t" rust-i2c-unit 2>/dev/null | grep -q "Ok:.*1"; then \
-	        passed=$$((passed + 1)); \
-	        echo "  PASS $$t"; \
-	    else \
-	        echo "  FAIL $$t"; \
-	    fi; \
-	done; \
-	echo "=== Rust QTest (I2C/SPI devices) ==="; \
-	for t in $(RUST_QTEST_TESTS); do \
-	    if cd $(BUILD_DIR) && $(MESON) test --no-rebuild --print-errorlogs \
-	        "qtest-riscv64/$$t" 2>/dev/null; then \
-	        passed=$$((passed + 1)); \
-	        echo "  PASS $$t"; \
-	    else \
-	        echo "  FAIL $$t"; \
-	    fi; \
-	done; \
-	echo "$$passed" > $(BUILD_DIR)/rust-result.log; \
-	score=$$((passed * 10)); \
-	echo "--- Rust experiment: $$passed/10 tests passed, score $$score/100 ---"
-
 # ─── Run all tests ────────────────────────────────────────────────────
 
 .PHONY: test
-test: test-cpu test-soc test-gpgpu test-rust
+test: test-gpgpu
 	@echo "=== All experiment tests done ==="
 
 # ─── Clean ────────────────────────────────────────────────────────────
